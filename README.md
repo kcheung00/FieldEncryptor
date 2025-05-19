@@ -6,12 +6,12 @@ How to use:
 
 To encrypt:
 ```
-java FieldEncryptor -e db.password,db.username src/main/resources/config.properties
+java FieldEncryptor -e <field1,field2> <src/main/resources/config.properties>
 ```
 
 To decrypt:
 ```
-java FieldEncryptor -d db.password,db.username src/main/resources/config.properties
+java FieldEncryptor -d <field1,field2> <src/main/resources/config.properties>
 ```
 
 The program marks encrypted fields with {enc} to avoid double encryption.
