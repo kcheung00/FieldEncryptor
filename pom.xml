@@ -72,7 +72,7 @@
           </descriptorRefs>
           <archive>
             <manifest>
-              <mainClass>com.gundam.app.FieldEncryptor</mainClass>
+              <mainClass>com.gundam.FieldEncryptor</mainClass>
             </manifest>
           </archive>
         </configuration>
