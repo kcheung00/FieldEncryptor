@@ -1,109 +1,155 @@
-package com.gundam;
+package com.fieldencryptor;
 
 import javax.crypto.Cipher;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
-import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
+import java.security.spec.KeySpec;
 import java.util.Base64;
-import java.util.Properties;
-import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-public class FieldEncryptor {
-    // You may want to store the key securely, not in code
-    private static final String KEY = "F3b7sX9qT2mZ0wVxK8r1N5j2Y4u6L0pQ"; // 32 bytes (AES-256)
-    private static final String ALGORITHM = "AES";
-    private static final String TRANSFORMATION = "AES/ECB/PKCS5Padding";
+/**
+ * SafeFieldEncryptor
+ *
+ * - AEAD: AES-256-GCM
+ * - KDF: PBKDF2WithHmacSHA512 with high iteration count and random salt
+ * - Randomness: SecureRandom for salt and IV
+ * - Envelope: JSON-like string containing version, kdf, iterations, salt, iv, key_id, ciphertext
+ *
+ * Usage notes:
+ * - Prefer using a KMS to store/encrypt keys. If using passwords, treat them as sensitive and do not keep in memory longer than needed.
+ * - This implementation is intentionally dependency-free (no external JSON libs). The envelope format is simple and human-readable,
+ *   but you should consider using a formal serializer (Jackson/Gson) in your project.
+ */
+public final class SafeFieldEncryptor {
+    private SafeFieldEncryptor() {}
 
-    // Encrypt a single value and return as base64
-    public static String encrypt(String value) throws Exception {
-        SecretKeySpec keySpec = new SecretKeySpec(KEY.getBytes(StandardCharsets.UTF_8), ALGORITHM);
-        Cipher cipher = Cipher.getInstance(TRANSFORMATION);
-        cipher.init(Cipher.ENCRYPT_MODE, keySpec);
-        byte[] encryptedBytes = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
-        return Base64.getEncoder().encodeToString(encryptedBytes);
+    // Format and constants
+    private static final String CIPHER = "AES/GCM/NoPadding";
+    private static final String KDF_ALGORITHM = "PBKDF2WithHmacSHA512";
+    private static final int AES_KEY_BITS = 256;
+    private static final int GCM_TAG_LENGTH_BITS = 128; // recommended
+    private static final int IV_LENGTH_BYTES = 12; // recommended for GCM
+    private static final int SALT_LENGTH_BYTES = 16;
+    private static final int PBKDF2_ITERATIONS = 200_000; // tune based on target platform; >=200k recommended for servers
+    private static final SecureRandom RNG = new SecureRandom();
+
+    private static final Base64.Encoder B64 = Base64.getEncoder();
+    private static final Base64.Decoder B64D = Base64.getDecoder();
+
+    /**
+     * Encrypt plaintext using a password-derived key.
+     *
+     * The returned string is a JSON-like envelope. Example:
+     * {"version":1,"kdf":"PBKDF2WithHmacSHA512","iterations":200000,"salt":"...","key_id":"my-key","iv":"...","ciphertext":"..."}
+     *
+     * keyId can be a KMS identifier or application key label. If you use a KMS master key, prefer deriving a data key from KMS and call
+     * an overload that accepts byte[] symmetricKey instead of a password.
+     *
+     * @param plaintext text to encrypt
+     * @param password  password (as char[]) to derive a key; the method will not modify the char[] but callers should clear it when done
+     * @param keyId     optional key identifier (can be null)
+     * @return envelope string (safe to persist)
+     * @throws Exception on crypto errors
+     */
+    public static String encrypt(String plaintext, char[] password, String keyId) throws Exception {
+        // 1. Generate salt
+        byte[] salt = new byte[SALT_LENGTH_BYTES];
+        RNG.nextBytes(salt);
+
+        // 2. Derive key using PBKDF2
+        SecretKeySpec aesKey = deriveAesKey(password, salt, PBKDF2_ITERATIONS);
+
+        // 3. Generate IV/nonce for GCM
+        byte[] iv = new byte[IV_LENGTH_BYTES];
+        RNG.nextBytes(iv);
+
+        // 4. Perform AES-GCM encryption
+        Cipher cipher = Cipher.getInstance(CIPHER);
+        GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
+        cipher.init(Cipher.ENCRYPT_MODE, aesKey, gcmSpec);
+        byte[] ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
+
+        // 5. Build envelope
+        String envelope = String.format(
+                "{\"version\":1,\"kdf\":\"%s\",\"iterations\":%d,\"salt\":\"%s\",\"key_id\":\"%s\",\"iv\":\"%s\",\"ciphertext\":\"%s\"}",
+                KDF_ALGORITHM,
+                PBKDF2_ITERATIONS,
+                B64.encodeToString(salt),
+                keyId == null ? "" : escapeJson(keyId),
+                B64.encodeToString(iv),
+                B64.encodeToString(ciphertext)
+        );
+
+        return envelope;
     }
 
-    // Decrypt a single base64-encoded value
-    public static String decrypt(String encryptedBase64) throws Exception {
-        SecretKeySpec keySpec = new SecretKeySpec(KEY.getBytes(StandardCharsets.UTF_8), ALGORITHM);
-        Cipher cipher = Cipher.getInstance(TRANSFORMATION);
-        cipher.init(Cipher.DECRYPT_MODE, keySpec);
-        byte[] encryptedBytes = Base64.getDecoder().decode(encryptedBase64);
-        byte[] decryptedBytes = cipher.doFinal(encryptedBytes);
-        return new String(decryptedBytes, StandardCharsets.UTF_8);
+    /**
+     * Decrypt the envelope produced by encrypt().
+     *
+     * @param envelope JSON-like string returned by encrypt(...)
+     * @param password password used to derive the key (char[]). Callers should zero it after use.
+     * @return plaintext
+     * @throws Exception on crypto errors or authentication failure
+     */
+    public static String decrypt(String envelope, char[] password) throws Exception {
+        // Simple extraction using regex - this avoids a JSON dependency for this example.
+        // Replace with a real JSON parser in production code for robustness.
+        String saltB64 = extractField(envelope, "\"salt\"");
+        String iterationsText = extractFieldRawNumber(envelope, "\"iterations\"");
+        String ivB64 = extractField(envelope, "\"iv\"");
+        String ctB64 = extractField(envelope, "\"ciphertext\"");
+
+        if (saltB64 == null || ivB64 == null || ctB64 == null || iterationsText == null) {
+            throw new IllegalArgumentException("Invalid envelope format");
+        }
+
+        int iterations = Integer.parseInt(iterationsText);
+
+        byte[] salt = B64D.decode(saltB64);
+        byte[] iv = B64D.decode(ivB64);
+        byte[] ciphertext = B64D.decode(ctB64);
+
+        SecretKeySpec aesKey = deriveAesKey(password, salt, iterations);
+
+        Cipher cipher = Cipher.getInstance(CIPHER);
+        GCMParameterSpec gcmSpec = new GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv);
+        cipher.init(Cipher.DECRYPT_MODE, aesKey, gcmSpec);
+
+        byte[] plaintext = cipher.doFinal(ciphertext);
+        return new String(plaintext, StandardCharsets.UTF_8);
     }
 
-    // Encrypt specified fields in a properties file
-    public static void encryptFields(String filePath, Set<String> fields) throws Exception {
-        Properties props = new Properties();
-        try (InputStream in = new FileInputStream(filePath)) {
-            props.load(in);
-        }
-
-        boolean changed = false;
-        for (String key : fields) {
-            String value = props.getProperty(key);
-            if (value != null && !value.startsWith("{enc}")) {
-                String encrypted = encrypt(value);
-                props.setProperty(key, "{enc}" + encrypted);
-                changed = true;
-            }
-        }
-        if (changed) {
-            try (OutputStream out = new FileOutputStream(filePath)) {
-                props.store(out, "Encrypted specified fields");
-            }
-            System.out.println("Encryption complete.");
-        } else {
-            System.out.println("No values updated or already encrypted.");
-        }
+    // Derives AES key bytes (256-bit) from password and salt using PBKDF2WithHmacSHA512
+    private static SecretKeySpec deriveAesKey(char[] password, byte[] salt, int iterations) throws Exception {
+        KeySpec spec = new PBEKeySpec(password, salt, iterations, AES_KEY_BITS);
+        SecretKeyFactory f = SecretKeyFactory.getInstance(KDF_ALGORITHM);
+        byte[] keyBytes = f.generateSecret(spec).getEncoded();
+        return new SecretKeySpec(keyBytes, "AES");
     }
 
-    // Decrypt specified fields in a properties file
-    public static void decryptFields(String filePath, Set<String> fields) throws Exception {
-        Properties props = new Properties();
-        try (InputStream in = new FileInputStream(filePath)) {
-            props.load(in);
-        }
-
-        boolean changed = false;
-        for (String key : fields) {
-            String value = props.getProperty(key);
-            if (value != null && value.startsWith("{enc}")) {
-                String decrypted = decrypt(value.substring(5));
-                props.setProperty(key, decrypted);
-                changed = true;
-            }
-        }
-        if (changed) {
-            try (OutputStream out = new FileOutputStream(filePath)) {
-                props.store(out, "Decrypted specified fields");
-            }
-            System.out.println("Decryption complete.");
-        } else {
-            System.out.println("No values updated or already decrypted.");
-        }
+    // Minimal JSON field extractor for base64 values and simple strings. Not a substitute for a proper JSON lib.
+    private static String extractField(String src, String fieldName) {
+        Pattern p = Pattern.compile(fieldName + "\\s*:\\s*\"([^\"]*)\"");
+        Matcher m = p.matcher(src);
+        if (!m.find()) return null;
+        return m.group(1);
     }
 
-    // Usage: java FieldEncryptor -e|-d <field1,field2,...> <filename>
-    public static void main(String[] args) {
-        if (args.length != 3 || (!args[0].equals("-e") && !args[0].equals("-d"))) {
-            System.out.println("Usage: java FieldEncryptor -e|-d <field1,field2,...> <src/main/resources/yourfile.properties>");
-            System.exit(1);
-        }
-        String mode = args[0];
-        Set<String> fields = Set.of(args[1].split(","));
-        String filePath = args[2];
+    // Extract numeric field (no quotes)
+    private static String extractFieldRawNumber(String src, String fieldName) {
+        Pattern p = Pattern.compile(fieldName + "\\s*:\\s*(\\d+)");
+        Matcher m = p.matcher(src);
+        if (!m.find()) return null;
+        return m.group(1);
+    }
 
-        try {
-            if (mode.equals("-e")) {
-                encryptFields(filePath, fields);
-            } else {
-                decryptFields(filePath, fields);
-            }
-        } catch (Exception ex) {
-            System.out.println("Operation failed: " + ex.getMessage());
-            ex.printStackTrace();
-        }
+    // Very small JSON string escaper for key_id usage; again prefer JSON library in production
+    private static String escapeJson(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 }
