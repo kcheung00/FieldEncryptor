@@ -25,8 +25,8 @@ import java.util.regex.Pattern;
  * - This implementation is intentionally dependency-free (no external JSON libs). The envelope format is simple and human-readable,
  *   but you should consider using a formal serializer (Jackson/Gson) in your project.
  */
-public final class SafeFieldEncryptor {
-    private SafeFieldEncryptor() {}
+public final class FieldEncryptor {
+    private FieldEncryptor() {}
 
     // Format and constants
     private static final String CIPHER = "AES/GCM/NoPadding";
